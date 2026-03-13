@@ -9,10 +9,10 @@ from torch.utils.data import DataLoader
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from tdmoe.model_adapters import find_expert_groups, stack_expert_weights, apply_expert_weights
-from tdmoe.rank_allocation import RankSearchConfig, search_ranks
-from tdmoe.tucker import whiten_tensor, recolor_factors, tucker_decompose, reconstruct
-from tdmoe.stats import OnlineCovariance, whitening_from_cov
+from model_adapters import find_expert_groups, stack_expert_weights, apply_expert_weights
+from rank_allocation import RankSearchConfig, search_ranks
+from tucker import whiten_tensor, recolor_factors, tucker_decompose, reconstruct
+from stats import OnlineCovariance, whitening_from_cov
 
 
 def load_calibration_texts(path: str | None, extra: List[str] | None) -> List[str]:
@@ -196,8 +196,8 @@ def main():
         texts = load_calibration_texts(args.calib_text_file, args.calib_text)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype))
-    model.to(args.device)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype), device_map="auto")
+    # model.to(args.device)
 
     dataloader = make_dataloader(tokenizer, texts, args.batch_size, args.seq_len)
 
