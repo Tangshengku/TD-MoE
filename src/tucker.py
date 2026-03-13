@@ -28,7 +28,16 @@ def recolor_factors(factors, s_out_inv: torch.Tensor | None, s_in_inv: torch.Ten
 
 
 def tucker_decompose(tensor: torch.Tensor, ranks: tuple[int, int, int], init="svd", tol=1e-6, n_iter_max=50):
-    core, factors = tucker(tensor, ranks=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
+    orig_dtype = tensor.dtype
+    if not torch.isfinite(tensor).all():
+        print("some infinite in the tensor")
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        tensor = tensor.float()
+    core, factors = tucker(tensor, rank=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
+    if orig_dtype != tensor.dtype:
+        core = core.to(orig_dtype)
+        factors = [f.to(orig_dtype) for f in factors]
     return core, factors
 
 

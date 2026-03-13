@@ -22,6 +22,7 @@ def covariance_from_batches(batches, eps: float = 1e-6):
             dtype = x.dtype
         if sum_xxt is None:
             sum_xxt = torch.zeros(x.shape[1], x.shape[1], device=device, dtype=dtype)
+        x = x.float()
         sum_xxt += x.t() @ x
         count += x.shape[0]
     if sum_xxt is None:

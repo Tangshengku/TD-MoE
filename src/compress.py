@@ -6,6 +6,7 @@ from typing import Iterable, List
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -78,6 +79,9 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
 
     def fwd_hook(_mod, inp, _out):
         x = inp[0].detach()
+        if not torch.isfinite(x).all():
+            print("Forward is not all finite")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
         cov_in.update(x)
 
     def bwd_hook(_mod, _grad_inp, grad_out):
@@ -85,6 +89,9 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
             return
         if grad_out and grad_out[0] is not None:
             g = grad_out[0].detach()
+            if not torch.isfinite(g).all():
+                print("Gradient is not all finite")
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
             cov_out.update(g)
 
     for m in modules:
@@ -93,7 +100,7 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
             handles.append(m.register_full_backward_hook(bwd_hook))
 
     model.eval()
-    for step, batch in enumerate(dataloader):
+    for step, batch in tqdm(enumerate(dataloader), desc="Calibrating..."):
         if step >= max_batches:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
