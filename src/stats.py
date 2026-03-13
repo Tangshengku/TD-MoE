@@ -78,6 +78,8 @@ def whitening_from_cov(cov: torch.Tensor):
     evals_sqrt = torch.sqrt(evals)
     s = (evecs * evals_inv_sqrt) @ evecs.t()
     s_inv = (evecs * evals_sqrt) @ evecs.t()
+    s = torch.nan_to_num(s, nan=0.0, posinf=1e4, neginf=-1e4)
+    s_inv = torch.nan_to_num(s_inv, nan=0.0, posinf=1e4, neginf=-1e4)
     if orig_dtype != cov.dtype:
         s = s.to(orig_dtype)
         s_inv = s_inv.to(orig_dtype)

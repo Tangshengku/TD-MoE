@@ -5,13 +5,13 @@ This is a lightweight implementation of the TD-MoE method described in the paper
 ## What’s implemented
 - Cross-expert tensorization: stack all experts’ weights in a layer into a 3D tensor `(K, d_out, d_in)`.
 - Multilinear whitening (input, output, or both): compute covariance of activations/gradients and apply whitening before decomposition.
-- Tucker decomposition with tensorly and re-coloring of factors.
+- Tucker decomposition (internal PyTorch implementation) and re-coloring of factors.
 - 3D rank allocation to match a target compression ratio.
 
 ## Install
 
 ```bash
-python -m pip install torch transformers tensorly
+python -m pip install torch transformers
 ```
 
 Optional for evaluation pipelines and WikiText-2 calibration:
@@ -66,7 +66,7 @@ Notes:
 
 - `tdmoe/compress.py`: CLI entry point.
 - `tdmoe/rank_allocation.py`: rank search for target compression.
-- `tdmoe/tucker.py`: tensorly Tucker decomposition helpers.
+- `tdmoe/tucker.py`: Tucker decomposition helpers.
 - `tdmoe/stats.py`: activation/gradient covariance collection.
 - `tdmoe/whitening.py`: whitening utilities.
 - `tdmoe/model_adapters.py`: expert discovery and weight handling.

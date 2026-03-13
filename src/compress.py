@@ -157,7 +157,14 @@ def compress_group(model, group, linear_names: List[str], dataloader, device, ma
                 s_out, s_out_inv = whitening_from_cov(cov_out)
 
         t_whitened = whiten_tensor(weight_tensor, s_out, s_in)
-        core, factors = tucker_decompose(t_whitened, ranks=(rank_res.r1, rank_res.r2, rank_res.r3))
+        device_override = None
+        if args.tucker_device in {"cpu", "cuda"}:
+            device_override = args.tucker_device
+        core, factors = tucker_decompose(
+            t_whitened,
+            ranks=(rank_res.r1, rank_res.r2, rank_res.r3),
+            device_override=device_override,
+        )
         factors = recolor_factors(factors, s_out_inv, s_in_inv)
         t_rec = reconstruct(core, factors)
 
@@ -188,6 +195,8 @@ def main():
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--max-batches", type=int, default=16)
     parser.add_argument("--linear-names", type=str, default="w1,w2,w3,up_proj,down_proj,gate_proj")
+    parser.add_argument("--tucker-device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--linalg-backend", type=str, choices=["default", "magma", "cusolver"], default="default")
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-path", type=str, default=None)
@@ -201,6 +210,9 @@ def main():
             raise ValueError(f"Unsupported calib-dataset: {args.calib_dataset}")
     else:
         texts = load_calibration_texts(args.calib_text_file, args.calib_text)
+
+    if args.linalg_backend != "default":
+        torch.backends.cuda.preferred_linalg_library(args.linalg_backend)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype), device_map="auto")

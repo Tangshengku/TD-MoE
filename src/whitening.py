@@ -9,7 +9,6 @@ def covariance_from_batches(batches, eps: float = 1e-6):
     Returns (cov, count).
     """
     device = None
-    dtype = None
     sum_xxt = None
     count = 0
     for x in batches:
@@ -19,10 +18,9 @@ def covariance_from_batches(batches, eps: float = 1e-6):
             x = x.view(-1, x.shape[-1])
         if device is None:
             device = x.device
-            dtype = x.dtype
         if sum_xxt is None:
-            sum_xxt = torch.zeros(x.shape[1], x.shape[1], device=device, dtype=dtype)
-        x = x.float()
+            sum_xxt = torch.zeros(x.shape[1], x.shape[1], device=device, dtype=torch.float32)
+        x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         sum_xxt += x.t() @ x
         count += x.shape[0]
     if sum_xxt is None:
@@ -34,13 +32,20 @@ def covariance_from_batches(batches, eps: float = 1e-6):
 
 def whitening_matrix(cov: torch.Tensor):
     """Return whitening matrix S = cov^{-1/2} and its inverse S_inv = cov^{1/2}."""
-    # Symmetric eigendecomposition
+    # Symmetric eigendecomposition in fp32
+    if cov.dtype in (torch.float16, torch.bfloat16):
+        cov = cov.float()
+    cov = 0.5 * (cov + cov.t())
+    if not torch.isfinite(cov).all():
+        cov = torch.nan_to_num(cov, nan=0.0, posinf=1e4, neginf=-1e4)
     evals, evecs = torch.linalg.eigh(cov)
     evals = torch.clamp(evals, min=1e-12)
     evals_inv_sqrt = torch.rsqrt(evals)
     evals_sqrt = torch.sqrt(evals)
     s = (evecs * evals_inv_sqrt) @ evecs.t()
     s_inv = (evecs * evals_sqrt) @ evecs.t()
+    s = torch.nan_to_num(s, nan=0.0, posinf=1e4, neginf=-1e4)
+    s_inv = torch.nan_to_num(s_inv, nan=0.0, posinf=1e4, neginf=-1e4)
     return s, s_inv
 
 
