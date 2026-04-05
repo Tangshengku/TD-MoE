@@ -91,7 +91,7 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
             g = grad_out[0].detach()
             if not torch.isfinite(g).all():
                 print("Gradient is not all finite")
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+                g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
             cov_out.update(g)
 
     for m in modules:
@@ -122,7 +122,7 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
     return cov_in_mat, cov_out_mat
 
 
-def compress_group(model, group, linear_names: List[str], dataloader, device, max_batches: int, target_reduction: float, whitening: str, eps: float):
+def compress_group(model, group, linear_names: List[str], dataloader, device, max_batches: int, target_reduction: float, whitening: str, eps: float, tucker_device: str = "auto"):
     results = {}
     for linear_name in linear_names:
         # Check if experts have this linear
@@ -158,8 +158,8 @@ def compress_group(model, group, linear_names: List[str], dataloader, device, ma
 
         t_whitened = whiten_tensor(weight_tensor, s_out, s_in)
         device_override = None
-        if args.tucker_device in {"cpu", "cuda"}:
-            device_override = args.tucker_device
+        if tucker_device in {"cpu", "cuda"}:
+            device_override = tucker_device
         core, factors = tucker_decompose(
             t_whitened,
             ranks=(rank_res.r1, rank_res.r2, rank_res.r3),
@@ -238,6 +238,7 @@ def main():
             target_reduction=args.target_reduction,
             whitening=args.whitening,
             eps=args.eps,
+            tucker_device=args.tucker_device,
         )
         if res:
             all_results[group.name] = res

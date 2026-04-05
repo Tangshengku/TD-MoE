@@ -59,8 +59,9 @@ def search_ranks(k: int, d_out: int, d_in: int, cfg: RankSearchConfig) -> RankSe
             if denom <= 0:
                 continue
             r3_float = (target_params - k * r1 - d_out * r2) / denom
-            r3 = int(round(r3_float))
-            r3 = max(1, min(max_r3, r3))
+            r3 = int(r3_float)  # floor, as per Algorithm 2 in the paper
+            if r3 < 1 or r3 > max_r3:  # paper: "if r3 < 1 or r3 > din: continue"
+                continue
 
             params = _params_tucker(k, d_out, d_in, r1, r2, r3)
             diff = abs(params - target_params)

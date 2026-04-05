@@ -16,7 +16,6 @@ class OnlineCovariance:
     def __post_init__(self):
         self.sum_xxt = torch.zeros(self.d, self.d, device=self.device, dtype=torch.float32)
         self.count = 0
-        self.orig_dtype = torch.float16
 
     def update(self, x: torch.Tensor):
         if x is None:
@@ -29,8 +28,7 @@ class OnlineCovariance:
 
     def finalize(self):
         cov = self.sum_xxt / max(self.count, 1)
-        cov = cov + self.eps * torch.eye(self.d, device=self.device, dtype=self.orig_dtype)
-        cov = cov.to(self.orig_dtype)
+        cov = cov + self.eps * torch.eye(self.d, device=self.device, dtype=torch.float32)
         return cov, self.count
 
 
@@ -73,7 +71,7 @@ def whitening_from_cov(cov: torch.Tensor):
         evals = evals.to(cov.device, dtype=cov.dtype)
         evecs = evecs.to(cov.device, dtype=cov.dtype)
 
-    evals = torch.clamp(evals, min=1e-12)
+    evals = torch.clamp(evals, min=1e-3)  # paper clips eigenvalues below 1e-3 for stability
     evals_inv_sqrt = torch.rsqrt(evals)
     evals_sqrt = torch.sqrt(evals)
     s = (evecs * evals_inv_sqrt) @ evecs.t()
