@@ -1,100 +1,25 @@
 from __future__ import annotations
 
 import torch
+import tensorly as tl
+from tensorly.decomposition import tucker as tl_tucker
+
+# Use PyTorch as the TensorLy backend throughout this module.
+tl.set_backend("pytorch")
 
 
-def _unfold(tensor: torch.Tensor, mode: int) -> torch.Tensor:
-    order = (mode,) + tuple(i for i in range(tensor.ndim) if i != mode)
-    return tensor.permute(order).reshape(tensor.shape[mode], -1)
-
-
-def mode_dot(tensor: torch.Tensor, matrix: torch.Tensor, mode: int) -> torch.Tensor:
-    if matrix.ndim != 2:
-        raise ValueError("mode_dot expects a 2D matrix")
-    if tensor.shape[mode] != matrix.shape[1]:
-        raise ValueError("mode_dot matrix has incompatible shape")
-    order = (mode,) + tuple(i for i in range(tensor.ndim) if i != mode)
-    transposed = tensor.permute(order)
-    unfolded = transposed.reshape(tensor.shape[mode], -1)
-    product = matrix @ unfolded
-    new_shape = (matrix.shape[0],) + tuple(tensor.shape[i] for i in range(tensor.ndim) if i != mode)
-    folded = product.reshape(new_shape)
-    inv_order = tuple(order.index(i) for i in range(tensor.ndim))
-    return folded.permute(inv_order)
-
-
-def tucker_to_tensor(tucker_tensor) -> torch.Tensor:
-    core, factors = tucker_tensor
-    out = core
-    for mode, factor in enumerate(factors):
-        out = mode_dot(out, factor, mode)
-    return out
-
-
-def tucker(
-    tensor: torch.Tensor,
-    rank: tuple[int, ...],
-    init: str = "svd",
-    tol: float = 1e-6,
-    n_iter_max: int = 50,
-):
-    if len(rank) != tensor.ndim:
-        raise ValueError("rank must match tensor.ndim")
-    if init not in {"svd", "random"}:
-        raise ValueError(f"Unsupported init: {init}")
-
-    factors = []
-    if init == "svd":
-        for mode in range(tensor.ndim):
-            unfolded = _unfold(tensor, mode)
-            u, _s, _vh = torch.linalg.svd(unfolded, full_matrices=False)
-            factors.append(u[:, : rank[mode]])
-    else:
-        for mode in range(tensor.ndim):
-            mat = torch.randn(
-                tensor.shape[mode],
-                rank[mode],
-                device=tensor.device,
-                dtype=tensor.dtype,
-            )
-            q, _r = torch.linalg.qr(mat, mode="reduced")
-            factors.append(q)
-
-    norm_tensor = torch.linalg.norm(tensor)
-    last_error = None
-    for _ in range(n_iter_max):
-        for mode in range(tensor.ndim):
-            core = tensor
-            for m in range(tensor.ndim):
-                if m == mode:
-                    continue
-                core = mode_dot(core, factors[m].T, m)
-            unfolded = _unfold(core, mode)
-            u, _s, _vh = torch.linalg.svd(unfolded, full_matrices=False)
-            factors[mode] = u[:, : rank[mode]]
-
-        core = tensor
-        for m in range(tensor.ndim):
-            core = mode_dot(core, factors[m].T, m)
-        rec = tucker_to_tensor((core, factors))
-        error = torch.linalg.norm(tensor - rec) / (norm_tensor + 1e-12)
-        if last_error is not None and abs(last_error - error) < tol:
-            break
-        last_error = error
-
-    return core, factors
-
-
-def whiten_tensor(tensor: torch.Tensor, s_out: torch.Tensor | None, s_in: torch.Tensor | None):
+def whiten_tensor(tensor: torch.Tensor, s_out: torch.Tensor | None, s_in: torch.Tensor | None) -> torch.Tensor:
+    """Apply multi-linear whitening: Tw = T ×2 Sout ×3 Sin (paper Eq. 4)."""
     out = tensor
     if s_out is not None:
-        out = mode_dot(out, s_out, mode=1)
+        out = tl.tenalg.mode_dot(out, s_out, mode=1)  # output mode (dout)
     if s_in is not None:
-        out = mode_dot(out, s_in, mode=2)
+        out = tl.tenalg.mode_dot(out, s_in, mode=2)   # input  mode (din)
     return out
 
 
 def recolor_factors(factors, s_out_inv: torch.Tensor | None, s_in_inv: torch.Tensor | None):
+    """Absorb inverse whitening into factors: U'2 = Sout^{-1} U2, U'3 = Sin^{-1} U3."""
     u1, u2, u3 = factors
     if s_out_inv is not None:
         u2 = s_out_inv @ u2
@@ -106,11 +31,12 @@ def recolor_factors(factors, s_out_inv: torch.Tensor | None, s_in_inv: torch.Ten
 def tucker_decompose(
     tensor: torch.Tensor,
     ranks: tuple[int, int, int],
-    init="svd",
-    tol=1e-6,
-    n_iter_max=50,
+    init: str = "svd",
+    tol: float = 1e-6,
+    n_iter_max: int = 50,
     device_override: str | None = None,
-):
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Tucker decomposition via TensorLy (HOOI).  Returns (core, [U1, U2, U3])."""
     orig_dtype = tensor.dtype
     orig_device = tensor.device
     if not torch.isfinite(tensor).all():
@@ -120,28 +46,31 @@ def tucker_decompose(
         tensor = tensor.float()
     if device_override == "cpu":
         tensor = tensor.cpu()
+
+    def _run(t: torch.Tensor):
+        result = tl_tucker(t, rank=list(ranks), n_iter_max=n_iter_max, init=init, tol=tol)
+        # TensorLy >= 0.7 returns a TuckerTensor named-tuple; older versions return a plain tuple.
+        core = result.core if hasattr(result, "core") else result[0]
+        factors = list(result.factors) if hasattr(result, "factors") else list(result[1])
+        return core, factors
+
     try:
-        try:
-            core, factors = tucker(tensor, rank=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
-        except TypeError:
-            core, factors = tucker(tensor, ranks=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
-    except BaseException as err:
-        # CPU fallback for stability (e.g., cusolver/magma errors)
+        core, factors = _run(tensor)
+    except Exception as err:
+        # CPU fallback for numerical stability (e.g. cusolver/magma errors on CUDA).
         if tensor.is_cuda and device_override != "cpu":
-            tensor_cpu = tensor.float().cpu()
-            try:
-                core, factors = tucker(tensor_cpu, rank=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
-            except TypeError:
-                core, factors = tucker(tensor_cpu, ranks=ranks, init=init, tol=tol, n_iter_max=n_iter_max)
+            core, factors = _run(tensor.float().cpu())
             core = core.to(orig_device)
             factors = [f.to(orig_device) for f in factors]
         else:
             raise err
+
     if orig_dtype != tensor.dtype:
         core = core.to(orig_dtype)
         factors = [f.to(orig_dtype) for f in factors]
     return core, factors
 
 
-def reconstruct(core: torch.Tensor, factors):
-    return tucker_to_tensor((core, factors))
+def reconstruct(core: torch.Tensor, factors) -> torch.Tensor:
+    """Reconstruct full tensor from Tucker factors: G ×1 U1 ×2 U2 ×3 U3."""
+    return tl.tucker_to_tensor((core, factors))
