@@ -10,6 +10,9 @@ tl.set_backend("pytorch")
 
 def whiten_tensor(tensor: torch.Tensor, s_out: torch.Tensor | None, s_in: torch.Tensor | None) -> torch.Tensor:
     """Apply multi-linear whitening: Tw = T ×2 Sout ×3 Sin (paper Eq. 4)."""
+    # Whitening matrices are float32; TensorLy's mode_dot requires matching dtypes.
+    if (s_out is not None or s_in is not None) and tensor.dtype in (torch.float16, torch.bfloat16):
+        tensor = tensor.float()
     out = tensor
     if s_out is not None:
         out = tl.tenalg.mode_dot(out, s_out, mode=1)  # output mode (dout)
