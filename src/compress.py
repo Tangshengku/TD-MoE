@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-from typing import Iterable, List
+import json
+import os
+from typing import List
+import tempfile
 
 import torch
 from torch.utils.data import DataLoader
@@ -10,6 +12,12 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from evaluate import (
+    evaluate_perplexity_suite,
+    parse_csv_arg,
+    run_lm_eval_harness,
+    save_hf_checkpoint,
+)
 from model_adapters import find_expert_groups, stack_expert_weights, apply_expert_weights
 from rank_allocation import RankSearchConfig, search_ranks
 from tucker import whiten_tensor, recolor_factors, tucker_decompose, reconstruct
@@ -247,6 +255,17 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-path", type=str, default=None)
+    parser.add_argument("--save-pretrained-path", type=str, default=None, help="Optional HF-format export path for the compressed model")
+    parser.add_argument("--eval-perplexity-datasets", type=str, default=None, help="Comma-separated list, e.g. wiki,ptb,c4")
+    parser.add_argument("--eval-max-samples", type=int, default=None)
+    parser.add_argument("--eval-seq-len", type=int, default=None)
+    parser.add_argument("--eval-stride", type=int, default=None)
+    parser.add_argument("--lm-eval-tasks", type=str, default=None, help="Comma-separated lm-evaluation-harness tasks, e.g. mmlu,arc_challenge")
+    parser.add_argument("--lm-eval-batch-size", type=str, default="auto")
+    parser.add_argument("--lm-eval-num-fewshot", type=int, default=0)
+    parser.add_argument("--lm-eval-limit", type=int, default=None)
+    parser.add_argument("--lm-eval-output-path", type=str, default=None)
+    parser.add_argument("--eval-report-path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -262,6 +281,8 @@ def main():
         torch.backends.cuda.preferred_linalg_library(args.linalg_backend)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype), device_map="auto")
     # model.to(args.device)
 
@@ -291,13 +312,71 @@ def main():
             all_results[group.name] = res
 
     if args.save_path:
+        os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
         torch.save({"model": model.state_dict(), "results": all_results}, args.save_path)
+
+    perplexity_results = {}
+    perplexity_datasets = parse_csv_arg(args.eval_perplexity_datasets)
+    if perplexity_datasets:
+        split_overrides = {
+            dataset_name: ("validation" if dataset_name.strip().lower() == "c4" else "test")
+            for dataset_name in perplexity_datasets
+        }
+        perplexity_results = evaluate_perplexity_suite(
+            model=model,
+            tokenizer=tokenizer,
+            dataset_names=perplexity_datasets,
+            split_overrides=split_overrides,
+            max_samples=args.eval_max_samples,
+            seq_len=args.eval_seq_len,
+            stride=args.eval_stride,
+        )
+
+    lm_eval_results = None
+    lm_eval_tasks = parse_csv_arg(args.lm_eval_tasks)
+    if args.save_pretrained_path:
+        save_hf_checkpoint(model, tokenizer, args.save_pretrained_path)
+    if lm_eval_tasks:
+        export_dir = args.save_pretrained_path
+        if export_dir is None:
+            tmpdir = tempfile.TemporaryDirectory(prefix="tdmoe_export_")
+            export_dir = tmpdir.name
+            save_hf_checkpoint(model, tokenizer, export_dir)
+        lm_eval_results = run_lm_eval_harness(
+            pretrained_path=export_dir,
+            tasks=lm_eval_tasks,
+            device=args.device,
+            batch_size=args.lm_eval_batch_size,
+            num_fewshot=args.lm_eval_num_fewshot,
+            limit=args.lm_eval_limit,
+            output_path=args.lm_eval_output_path,
+        )
 
     print("Compression summary:")
     for gname, res in all_results.items():
         print(f"- {gname}")
         for lname, info in res.items():
             print(f"  {lname}: ranks={info['ranks']} params={info['params']} target={info['target_params']} diff={info['diff']}")
+
+    if perplexity_results:
+        print("Perplexity results:")
+        for result in perplexity_results.values():
+            print(f"- {result['dataset']} ({result['split']}): ppl={result['perplexity']:.4f}")
+
+    if lm_eval_results:
+        print("lm-evaluation-harness:")
+        print(f"- tasks: {', '.join(lm_eval_results['tasks'])}")
+        print(f"- output_path: {lm_eval_results['output_path']}")
+
+    if args.eval_report_path:
+        payload = {
+            "compression": all_results,
+            "perplexity": perplexity_results,
+            "lm_eval": lm_eval_results,
+        }
+        os.makedirs(os.path.dirname(args.eval_report_path) or ".", exist_ok=True)
+        with open(args.eval_report_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
 
 if __name__ == "__main__":

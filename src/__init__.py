@@ -1,1 +1,1 @@
-__all__ = ["compress", "rank_allocation", "tucker", "whitening", "stats", "model_adapters", "factorized"]
+__all__ = ["compress", "evaluate", "rank_allocation", "tucker", "whitening", "stats", "model_adapters", "factorized"]

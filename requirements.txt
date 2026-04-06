@@ -2,3 +2,5 @@ torch
 transformers
 accelerate
 tensorly
+datasets
+lm_eval[hf]
