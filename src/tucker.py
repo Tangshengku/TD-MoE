@@ -78,7 +78,7 @@ def tucker_decompose(
         t0 = time.time()
         print(f"[tucker_decompose._run] device={t.device} dtype={t.dtype} "
               f"shape={tuple(t.shape)} init={init_mode!r} ranks={list(ranks)}")
-        result = tl_tucker(t, rank=list(ranks), n_iter_max=n_iter_max, init=init_mode, tol=tol)
+        result = tl_tucker(t, rank=list(ranks), n_iter_max=n_iter_max, init=init_mode, tol=tol, svd="randomized_svd", verbose=True)
         # TensorLy >= 0.7 returns a TuckerTensor named-tuple; older versions return a plain tuple.
         core = result.core if hasattr(result, "core") else result[0]
         factors = list(result.factors) if hasattr(result, "factors") else list(result[1])
@@ -88,31 +88,31 @@ def tucker_decompose(
               f"factor_shapes={[tuple(f.shape) for f in factors]}")
         return core, factors
 
-    try:
-        core, factors = _run(tensor)
-    except Exception as cuda_err:
-        if not tensor.is_cuda or device_override == "cpu":
-            # Already on CPU; SVD init failed — retry with random init.
-            print(f"[tucker_decompose] CPU SVD init failed ({type(cuda_err).__name__}: {cuda_err}); "
-                  f"retrying with init='random'")
-            t_clean = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
-            core, factors = _run(t_clean, init_mode="random")
-        else:
-            # CPU fallback for CUDA numerical errors (cusolver / magma SVD failures).
-            print(f"[tucker_decompose] CUDA failed ({type(cuda_err).__name__}: {cuda_err}); "
-                  f"retrying on CPU with nan_to_num cleanup")
-            t_cpu = torch.nan_to_num(tensor.float().cpu(), nan=0.0, posinf=1e4, neginf=-1e4)
-            print(f"[tucker_decompose] CPU tensor: finite={torch.isfinite(t_cpu).all().item()} "
-                  f"abs_max={t_cpu.abs().max().item():.4g}")
-            try:
-                core, factors = _run(t_cpu)
-            except Exception as cpu_err:
-                # SVD init also failed on CPU; last resort: random initialization.
-                print(f"[tucker_decompose] CPU SVD also failed ({type(cpu_err).__name__}: {cpu_err}); "
-                      f"last resort: init='random' on CPU")
-                core, factors = _run(t_cpu, init_mode="random")
-            core = core.to(orig_device)
-            factors = [f.to(orig_device) for f in factors]
+    # try:
+    core, factors = _run(tensor)
+    # except Exception as cuda_err:
+    #     if not tensor.is_cuda or device_override == "cpu":
+    #         # Already on CPU; SVD init failed — retry with random init.
+    #         print(f"[tucker_decompose] CPU SVD init failed ({type(cuda_err).__name__}: {cuda_err}); "
+    #               f"retrying with init='random'")
+    #         t_clean = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+    #         core, factors = _run(t_clean, init_mode="random")
+    #     else:
+    #         # CPU fallback for CUDA numerical errors (cusolver / magma SVD failures).
+    #         print(f"[tucker_decompose] CUDA failed ({type(cuda_err).__name__}: {cuda_err}); "
+    #               f"retrying on CPU with nan_to_num cleanup")
+    #         t_cpu = torch.nan_to_num(tensor.float().cpu(), nan=0.0, posinf=1e4, neginf=-1e4)
+    #         print(f"[tucker_decompose] CPU tensor: finite={torch.isfinite(t_cpu).all().item()} "
+    #               f"abs_max={t_cpu.abs().max().item():.4g}")
+    #         try:
+    #             core, factors = _run(t_cpu)
+    #         except Exception as cpu_err:
+    #             # SVD init also failed on CPU; last resort: random initialization.
+    #             print(f"[tucker_decompose] CPU SVD also failed ({type(cpu_err).__name__}: {cpu_err}); "
+    #                   f"last resort: init='random' on CPU")
+    #             core, factors = _run(t_cpu, init_mode="random")
+    #         core = core.to(orig_device)
+    #         factors = [f.to(orig_device) for f in factors]
 
     if orig_dtype != tensor.dtype:
         print(f"[tucker_decompose] casting output back to {orig_dtype}")

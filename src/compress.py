@@ -185,6 +185,7 @@ def compress_group(model, group, linear_names: List[str], dataloader, device, ma
         )
 
     for linear_name in available_linear_names:
+        print(f"Compressing {linear_name}")
         weight_tensor = stack_expert_weights(group.experts, linear_name).to(device)
         k, d_out, d_in = weight_tensor.shape
 
@@ -296,7 +297,8 @@ def main():
     linear_names = [n.strip() for n in args.linear_names.split(",") if n.strip()]
 
     all_results = {}
-    for group in expert_groups:
+    for i, group in enumerate(expert_groups):
+        print(f"Compressing group {i+1} of {len(expert_groups)}")
         res = compress_group(
             model=model,
             group=group,
