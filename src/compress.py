@@ -68,36 +68,61 @@ def make_dataloader(tokenizer, texts: List[str], batch_size: int, seq_len: int):
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate)
 
 
-def collect_covariances(model, modules: List[torch.nn.Module], dataloader, device, max_batches: int, collect_grad: bool, eps: float):
-    # Assume all modules have same input/output dims
-    sample = modules[0]
-    d_out, d_in = sample.weight.shape
-    cov_in = OnlineCovariance(d_in, device=device, dtype=sample.weight.dtype, eps=eps)
-    cov_out = OnlineCovariance(d_out, device=device, dtype=sample.weight.dtype, eps=eps) if collect_grad else None
+def collect_group_covariances(
+    model,
+    modules_by_name: dict[str, List[torch.nn.Module]],
+    dataloader,
+    device,
+    max_batches: int,
+    collect_grad: bool,
+    eps: float,
+    cache_device: str | torch.device = "cpu",
+):
+    covariances = {}
+    for linear_name, modules in modules_by_name.items():
+        if not modules:
+            continue
+        sample = modules[0]
+        d_out, d_in = sample.weight.shape
+        stats_device = sample.weight.device
+        covariances[linear_name] = {
+            "cov_in": OnlineCovariance(d_in, device=stats_device, dtype=sample.weight.dtype, eps=eps),
+            "cov_out": OnlineCovariance(d_out, device=stats_device, dtype=sample.weight.dtype, eps=eps) if collect_grad else None,
+        }
 
     handles = []
 
-    def fwd_hook(_mod, inp, _out):
-        x = inp[0].detach()
-        if not torch.isfinite(x).all():
-            print("Forward is not all finite")
-            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
-        cov_in.update(x)
+    def make_fwd_hook(linear_name: str):
+        def fwd_hook(_mod, inp, _out):
+            x = inp[0].detach()
+            if not torch.isfinite(x).all():
+                print(f"Forward for {linear_name} is not all finite")
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            covariances[linear_name]["cov_in"].update(x)
 
-    def bwd_hook(_mod, _grad_inp, grad_out):
-        if cov_out is None:
-            return
-        if grad_out and grad_out[0] is not None:
-            g = grad_out[0].detach()
-            if not torch.isfinite(g).all():
-                print("Gradient is not all finite")
-                g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
-            cov_out.update(g)
+        return fwd_hook
 
-    for m in modules:
-        handles.append(m.register_forward_hook(fwd_hook))
-        if collect_grad:
-            handles.append(m.register_full_backward_hook(bwd_hook))
+    def make_bwd_hook(linear_name: str):
+        def bwd_hook(_mod, _grad_inp, grad_out):
+            cov_out = covariances[linear_name]["cov_out"]
+            if cov_out is None:
+                return
+            if grad_out and grad_out[0] is not None:
+                g = grad_out[0].detach()
+                if not torch.isfinite(g).all():
+                    print(f"Gradient for {linear_name} is not all finite")
+                    g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+                cov_out.update(g)
+
+        return bwd_hook
+
+    for linear_name, modules in modules_by_name.items():
+        fwd_hook = make_fwd_hook(linear_name)
+        bwd_hook = make_bwd_hook(linear_name)
+        for module in modules:
+            handles.append(module.register_forward_hook(fwd_hook))
+            if collect_grad:
+                handles.append(module.register_full_backward_hook(bwd_hook))
 
     model.eval()
     for step, batch in tqdm(enumerate(dataloader), desc="Calibrating..."):
@@ -115,21 +140,42 @@ def collect_covariances(model, modules: List[torch.nn.Module], dataloader, devic
     for h in handles:
         h.remove()
 
-    cov_in_mat, _ = cov_in.finalize()
-    cov_out_mat = None
-    if cov_out is not None:
-        cov_out_mat, _ = cov_out.finalize()
-    return cov_in_mat, cov_out_mat
+    cached = {}
+    for linear_name, stats in covariances.items():
+        cov_in_mat, _ = stats["cov_in"].finalize()
+        cov_out_mat = None
+        if stats["cov_out"] is not None:
+            cov_out_mat, _ = stats["cov_out"].finalize()
+
+        cached[linear_name] = {
+            "cov_in": cov_in_mat.to(cache_device),
+            "cov_out": cov_out_mat.to(cache_device) if cov_out_mat is not None else None,
+        }
+
+    return cached
 
 
 def compress_group(model, group, linear_names: List[str], dataloader, device, max_batches: int, target_reduction: float, whitening: str, eps: float, tucker_device: str = "auto"):
     results = {}
-    for linear_name in linear_names:
-        # Check if experts have this linear
-        if not hasattr(group.experts[0], linear_name):
-            continue
+    available_linear_names = [linear_name for linear_name in linear_names if hasattr(group.experts[0], linear_name)]
+    covariance_cache = {}
+    if whitening in {"input", "both", "output"} and available_linear_names:
+        modules_by_name = {
+            linear_name: [getattr(exp, linear_name) for exp in group.experts]
+            for linear_name in available_linear_names
+        }
+        covariance_cache = collect_group_covariances(
+            model=model,
+            modules_by_name=modules_by_name,
+            dataloader=dataloader,
+            device=device,
+            max_batches=max_batches,
+            collect_grad=whitening in {"output", "both"},
+            eps=eps,
+            cache_device="cpu",
+        )
 
-        modules = [getattr(exp, linear_name) for exp in group.experts]
+    for linear_name in available_linear_names:
         weight_tensor = stack_expert_weights(group.experts, linear_name).to(device)
         k, d_out, d_in = weight_tensor.shape
 
@@ -140,21 +186,22 @@ def compress_group(model, group, linear_names: List[str], dataloader, device, ma
         s_out = s_out_inv = None
 
         if whitening in {"input", "both", "output"}:
-            cov_in, cov_out = collect_covariances(
-                model=model,
-                modules=modules,
-                dataloader=dataloader,
-                device=device,
-                max_batches=max_batches,
-                collect_grad=whitening in {"output", "both"},
-                eps=eps,
-            )
+            cached_covariances = covariance_cache.get(linear_name)
+            if cached_covariances is None:
+                raise RuntimeError(f"Missing cached covariances for {group.name}.{linear_name}")
+
+            cov_in = cached_covariances["cov_in"]
+            cov_out = cached_covariances["cov_out"]
             if whitening in {"input", "both"}:
                 s_in, s_in_inv = whitening_from_cov(cov_in)
+                s_in = s_in.to(weight_tensor.device)
+                s_in_inv = s_in_inv.to(weight_tensor.device)
             if whitening in {"output", "both"}:
                 if cov_out is None:
                     raise RuntimeError("Output covariance requested but not collected")
                 s_out, s_out_inv = whitening_from_cov(cov_out)
+                s_out = s_out.to(weight_tensor.device)
+                s_out_inv = s_out_inv.to(weight_tensor.device)
 
         t_whitened = whiten_tensor(weight_tensor, s_out, s_in)
         device_override = None
