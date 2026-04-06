@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
+
+
+def log(message: str):
+    print(f"[tdmoe-eval] {message}", flush=True)
 
 
 def _require_datasets():
@@ -46,16 +53,19 @@ def load_model_and_tokenizer(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_path: str | None = None,
 ):
+    log(f"Loading tokenizer from {model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    log(f"Loading model from {model_name_or_path} with dtype={dtype} device={device}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=_normalize_dtype(dtype),
         device_map="auto" if device.startswith("cuda") or device == "auto" else None,
     )
     if checkpoint_path:
+        log(f"Loading compressed checkpoint from {checkpoint_path}")
         payload = torch.load(checkpoint_path, map_location="cpu")
         state_dict = _extract_state_dict(payload)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -66,12 +76,14 @@ def load_model_and_tokenizer(
     if not (device.startswith("cuda") or device == "auto"):
         model.to(device)
     model.eval()
+    log("Model and tokenizer are ready for evaluation")
     return model, tokenizer
 
 
 def save_hf_checkpoint(model, tokenizer, output_dir: str):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    log(f"Saving Hugging Face checkpoint for evaluation to {out}")
     model.save_pretrained(out)
     tokenizer.save_pretrained(out)
     return str(out)
@@ -91,11 +103,16 @@ def _dataset_spec(name: str, split: str, max_samples: int | None):
 
 def load_eval_texts(dataset_name: str, split: str, max_samples: int | None) -> List[str]:
     load_dataset = _require_datasets()
-    path, config, split_expr, field, _ = _dataset_spec(dataset_name, split, max_samples)
+    path, config, split_expr, field, canonical_name = _dataset_spec(dataset_name, split, max_samples)
+    log(
+        f"Loading perplexity dataset {canonical_name}: "
+        f"path={path} config={config} split={split_expr}"
+    )
     try:
         ds = load_dataset(path, config, split=split_expr)
     except Exception:
         if dataset_name.strip().lower() == "c4":
+            log("Primary C4 path failed, retrying with fallback dataset id c4/en")
             ds = load_dataset("c4", "en", split=split_expr)
         else:
             raise
@@ -109,6 +126,7 @@ def load_eval_texts(dataset_name: str, split: str, max_samples: int | None) -> L
             texts.append(text)
     if not texts:
         raise RuntimeError(f"{dataset_name} yielded no usable text")
+    log(f"Loaded {len(texts)} non-empty documents from {canonical_name}")
     return texts
 
 
@@ -140,8 +158,11 @@ def evaluate_perplexity(
     seq_len: int | None = None,
     stride: int | None = None,
 ):
+    started = time.time()
+    log(f"Starting perplexity evaluation for dataset={dataset_name} split={split}")
     texts = load_eval_texts(dataset_name, split=split, max_samples=max_samples)
     text = "\n\n".join(texts)
+    log(f"Tokenizing concatenated corpus for {dataset_name}")
     encodings = tokenizer(text, return_tensors="pt")
     input_ids = encodings["input_ids"][0]
     if input_ids.numel() < 2:
@@ -150,12 +171,17 @@ def evaluate_perplexity(
     max_length = _infer_max_length(model, tokenizer, seq_len)
     stride = stride or max_length
     device = _infer_eval_device(model)
+    num_windows = max(1, math.ceil(max(0, input_ids.size(0) - max_length) / stride) + 1)
+    log(
+        f"Perplexity config for {dataset_name}: tokens={input_ids.size(0)} "
+        f"seq_len={max_length} stride={stride} windows={num_windows} device={device}"
+    )
 
     nll_sum = torch.tensor(0.0, device=device)
     total_tokens = 0
     prev_end = 0
 
-    for begin in range(0, input_ids.size(0), stride):
+    for begin in tqdm(range(0, input_ids.size(0), stride), desc=f"ppl:{dataset_name}", leave=False):
         end = min(begin + max_length, input_ids.size(0))
         target_len = end - prev_end
         if target_len <= 0:
@@ -184,6 +210,7 @@ def evaluate_perplexity(
         "seq_len": int(max_length),
         "stride": int(stride),
         "perplexity": float(perplexity),
+        "elapsed_sec": float(time.time() - started),
     }
 
 
@@ -200,6 +227,7 @@ def evaluate_perplexity_suite(
     split_overrides = split_overrides or {}
     for dataset_name in dataset_names:
         split = split_overrides.get(dataset_name.strip().lower(), "test")
+        log(f"Queueing perplexity evaluation for {dataset_name} on split={split}")
         results[dataset_name] = evaluate_perplexity(
             model=model,
             tokenizer=tokenizer,
@@ -249,6 +277,13 @@ def run_lm_eval_harness(
     if limit is not None:
         cmd.extend(["--limit", str(limit)])
 
+    log(
+        f"Launching lm-evaluation-harness for tasks={','.join(tasks)} "
+        f"device={lm_eval_device} batch_size={batch_size} num_fewshot={num_fewshot}"
+    )
+    log(f"lm-eval output path: {output_dir}")
+    log(f"lm-eval command: {' '.join(cmd)}")
+    started = time.time()
     completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return {
         "tasks": tasks,
@@ -256,6 +291,7 @@ def run_lm_eval_harness(
         "command": cmd,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
+        "elapsed_sec": float(time.time() - started),
     }
 
 
@@ -270,7 +306,8 @@ def _print_perplexity_results(results: Dict[str, Dict[str, Any]]):
     for key, result in results.items():
         print(
             f"- {result['dataset']} ({result['split']}): "
-            f"ppl={result['perplexity']:.4f} tokens={result['num_tokens']} texts={result['num_texts']}"
+            f"ppl={result['perplexity']:.4f} tokens={result['num_tokens']} "
+            f"texts={result['num_texts']} elapsed={result['elapsed_sec']:.1f}s"
         )
 
 
@@ -280,6 +317,7 @@ def _print_lm_eval_result(result: Dict[str, Any] | None):
     print("lm-evaluation-harness:")
     print(f"- tasks: {', '.join(result['tasks'])}")
     print(f"- output_path: {result['output_path']}")
+    print(f"- elapsed: {result['elapsed_sec']:.1f}s")
 
 
 def main():
@@ -300,6 +338,7 @@ def main():
     parser.add_argument("--export-pretrained-path", type=str, default=None, help="Optional HF-format export dir used for lm-eval")
     parser.add_argument("--report-path", type=str, default=None)
     args = parser.parse_args()
+    log(f"Evaluation request: model={args.model} checkpoint_path={args.checkpoint_path}")
 
     model, tokenizer = load_model_and_tokenizer(
         model_name_or_path=args.model,
@@ -341,6 +380,7 @@ def main():
         _print_lm_eval_result(lm_eval_result)
 
     if args.report_path:
+        log(f"Writing evaluation report to {args.report_path}")
         report = {
             "model": args.model,
             "checkpoint_path": args.checkpoint_path,

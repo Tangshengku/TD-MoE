@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from evaluate import (
     evaluate_perplexity_suite,
+    log as eval_log,
     parse_csv_arg,
     run_lm_eval_harness,
     save_hf_checkpoint,
@@ -318,6 +319,7 @@ def main():
     perplexity_results = {}
     perplexity_datasets = parse_csv_arg(args.eval_perplexity_datasets)
     if perplexity_datasets:
+        eval_log(f"Starting post-compression perplexity evaluation for datasets={','.join(perplexity_datasets)}")
         split_overrides = {
             dataset_name: ("validation" if dataset_name.strip().lower() == "c4" else "test")
             for dataset_name in perplexity_datasets
@@ -335,8 +337,10 @@ def main():
     lm_eval_results = None
     lm_eval_tasks = parse_csv_arg(args.lm_eval_tasks)
     if args.save_pretrained_path:
+        eval_log(f"Exporting compressed model to Hugging Face format at {args.save_pretrained_path}")
         save_hf_checkpoint(model, tokenizer, args.save_pretrained_path)
     if lm_eval_tasks:
+        eval_log(f"Starting post-compression lm-eval tasks={','.join(lm_eval_tasks)}")
         export_dir = args.save_pretrained_path
         if export_dir is None:
             tmpdir = tempfile.TemporaryDirectory(prefix="tdmoe_export_")
