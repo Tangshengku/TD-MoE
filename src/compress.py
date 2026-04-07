@@ -542,6 +542,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--max-batches", type=int, default=16)
+    parser.add_argument("--selection-batch-size", type=int, default=None, help="Optional batch size for layer selection calibration")
+    parser.add_argument("--selection-seq-len", type=int, default=None, help="Optional sequence length for layer selection calibration")
+    parser.add_argument("--selection-max-batches", type=int, default=None, help="Optional max batches for layer selection calibration")
     parser.add_argument("--linear-names", type=str, default="w1,w2,w3,up_proj,down_proj,gate_proj")
     parser.add_argument("--tucker-device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--linalg-backend", type=str, choices=["default", "magma", "cusolver"], default="default")
@@ -585,7 +588,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype), device_map="auto")
     # model.to(args.device)
 
-    dataloader = make_dataloader(tokenizer, texts, args.batch_size, args.seq_len)
+    compression_dataloader = make_dataloader(tokenizer, texts, args.batch_size, args.seq_len)
+    selection_batch_size = args.selection_batch_size or args.batch_size
+    selection_seq_len = args.selection_seq_len or args.seq_len
+    selection_max_batches = args.selection_max_batches or args.max_batches
+    selection_dataloader = make_dataloader(tokenizer, list(texts), selection_batch_size, selection_seq_len)
 
     expert_groups = find_expert_groups(model)
     if not expert_groups:
@@ -604,9 +611,9 @@ def main():
         sensitivity_scores = collect_group_sensitivity_scores(
             model=model,
             expert_groups=expert_groups,
-            dataloader=dataloader,
+            dataloader=selection_dataloader,
             device=args.device,
-            max_batches=args.max_batches,
+            max_batches=selection_max_batches,
             linear_names=linear_names,
             tau=args.layer_sensitivity_tau,
             smoothing=args.layer_allocation_smoothing,
@@ -642,7 +649,7 @@ def main():
             model=model,
             group=group,
             linear_names=linear_names,
-            dataloader=dataloader,
+            dataloader=compression_dataloader,
             device=args.device,
             max_batches=args.max_batches,
             target_reduction=group_target_reduction,
