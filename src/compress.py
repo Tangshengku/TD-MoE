@@ -115,7 +115,7 @@ def collect_group_covariances(
             continue
         sample = modules[0]
         d_out, d_in = sample.weight.shape
-        stats_device = sample.weight.device
+        stats_device = torch.device(cache_device)
         covariances[linear_name] = {
             "cov_in": OnlineCovariance(d_in, device=stats_device, dtype=sample.weight.dtype, eps=eps),
             "cov_out": OnlineCovariance(d_out, device=stats_device, dtype=sample.weight.dtype, eps=eps) if collect_grad else None,
@@ -129,7 +129,7 @@ def collect_group_covariances(
             if not torch.isfinite(x).all():
                 print(f"Forward for {linear_name} is not all finite")
                 x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
-            covariances[linear_name]["cov_in"].update(x)
+            covariances[linear_name]["cov_in"].update(x.to(covariances[linear_name]["cov_in"].device, non_blocking=True))
 
         return fwd_hook
 
@@ -143,7 +143,7 @@ def collect_group_covariances(
                 if not torch.isfinite(g).all():
                     print(f"Gradient for {linear_name} is not all finite")
                     g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
-                cov_out.update(g)
+                cov_out.update(g.to(cov_out.device, non_blocking=True))
 
         return bwd_hook
 
@@ -164,9 +164,14 @@ def collect_group_covariances(
         if collect_grad:
             out = model(**batch)
             out.loss.backward()
+            del out
         else:
             with torch.no_grad():
-                model(**batch)
+                out = model(**batch)
+                del out
+        del batch
+        model.zero_grad(set_to_none=True)
+        cleanup_memory()
 
     for h in handles:
         h.remove()
@@ -452,22 +457,6 @@ def compress_group(
 ):
     results = {}
     available_linear_names = [linear_name for linear_name in linear_names if hasattr(group.experts[0], linear_name)]
-    covariance_cache = {}
-    if whitening in {"input", "both", "output"} and available_linear_names:
-        modules_by_name = {
-            linear_name: [getattr(exp, linear_name) for exp in group.experts]
-            for linear_name in available_linear_names
-        }
-        covariance_cache = collect_group_covariances(
-            model=model,
-            modules_by_name=modules_by_name,
-            dataloader=dataloader,
-            device=device,
-            max_batches=max_batches,
-            collect_grad=whitening in {"output", "both"},
-            eps=eps,
-            cache_device="cpu",
-        )
 
     for linear_name in available_linear_names:
         print(f"Compressing {linear_name}")
@@ -484,7 +473,16 @@ def compress_group(
         s_out = s_out_inv = None
 
         if whitening in {"input", "both", "output"}:
-            cached_covariances = covariance_cache.get(linear_name)
+            cached_covariances = collect_group_covariances(
+                model=model,
+                modules_by_name={linear_name: [getattr(exp, linear_name) for exp in group.experts]},
+                dataloader=dataloader,
+                device=device,
+                max_batches=max_batches,
+                collect_grad=whitening in {"output", "both"},
+                eps=eps,
+                cache_device="cpu",
+            ).get(linear_name)
             if cached_covariances is None:
                 raise RuntimeError(f"Missing cached covariances for {group.name}.{linear_name}")
 
@@ -522,9 +520,10 @@ def compress_group(
             "diff": rank_res.diff,
         }
         del weight_tensor, t_whitened, core, factors, t_rec
+        if whitening in {"input", "both", "output"}:
+            del cached_covariances, cov_in, cov_out
         cleanup_memory()
 
-    del covariance_cache
     cleanup_memory()
     return results
 
