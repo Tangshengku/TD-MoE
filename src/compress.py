@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import List
+import re
+from dataclasses import dataclass
+from typing import Dict, List
 import tempfile
 
 import torch
@@ -19,7 +21,7 @@ from evaluate import (
     run_lm_eval_harness,
     save_hf_checkpoint,
 )
-from model_adapters import find_expert_groups, stack_expert_weights, apply_expert_weights
+from model_adapters import ExpertGroup, find_expert_groups, stack_expert_weights, apply_expert_weights
 from rank_allocation import RankSearchConfig, search_ranks
 from tucker import whiten_tensor, recolor_factors, tucker_decompose, reconstruct
 from stats import OnlineCovariance, whitening_from_cov
@@ -60,19 +62,32 @@ def load_wikitext2(split: str, max_samples: int | None) -> List[str]:
 
 
 def make_dataloader(tokenizer, texts: List[str], batch_size: int, seq_len: int):
-    encodings = tokenizer(
-        texts,
-        truncation=True,
-        padding=True,
-        max_length=seq_len,
-        return_tensors="pt",
-    )
-    dataset = torch.utils.data.TensorDataset(encodings["input_ids"], encodings["attention_mask"])
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("Tokenizer must define eos_token_id for calibration packing")
+    packed_token_ids = []
+    for text in texts:
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not token_ids:
+            continue
+        packed_token_ids.extend(token_ids)
+        packed_token_ids.append(eos_token_id)
+    if not packed_token_ids:
+        raise ValueError("Calibration corpus produced no tokens")
+    input_ids = torch.tensor(packed_token_ids, dtype=torch.long)
+    total_tokens = (input_ids.numel() // seq_len) * seq_len
+    if total_tokens == 0:
+        raise ValueError("Calibration corpus is too small for the configured seq_len")
+    input_ids = input_ids[:total_tokens].view(-1, seq_len)
+    attention_mask = torch.ones_like(input_ids)
+    dataset = torch.utils.data.TensorDataset(input_ids, attention_mask)
 
     def collate(batch):
         input_ids = torch.stack([b[0] for b in batch])
         attention_mask = torch.stack([b[1] for b in batch])
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": input_ids.clone()}
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate)
 
@@ -164,7 +179,184 @@ def collect_group_covariances(
     return cached
 
 
-def compress_group(model, group, linear_names: List[str], dataloader, device, max_batches: int, target_reduction: float, whitening: str, eps: float, tucker_device: str = "auto"):
+@dataclass
+class GroupAllocation:
+    importance: float
+    weight: float
+    original_params: int
+    target_params: int
+    target_reduction: float
+
+
+def _infer_router_top_k(model, group: ExpertGroup) -> int:
+    for attr in ("num_experts_per_tok", "num_local_experts_per_tok"):
+        value = getattr(getattr(model, "config", None), attr, None)
+        if isinstance(value, int) and value > 0:
+            return min(value, len(group.experts))
+    for attr in ("top_k", "num_experts_per_tok"):
+        value = getattr(group.module, attr, None)
+        if isinstance(value, int) and value > 0:
+            return min(value, len(group.experts))
+    return min(2, len(group.experts))
+
+
+def _extract_group_order(name: str) -> int | None:
+    match = re.search(r"\.(\d+)\.", name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _smooth_scores(groups: List[ExpertGroup], scores: Dict[str, float], alpha: float) -> Dict[str, float]:
+    if alpha <= 0:
+        return scores
+    ordered = sorted(
+        ((group, _extract_group_order(group.name)) for group in groups),
+        key=lambda item: (item[1] is None, item[1] if item[1] is not None else item[0].name),
+    )
+    result = dict(scores)
+    for idx, (group, layer_idx) in enumerate(ordered):
+        if layer_idx is None:
+            continue
+        neighbors = [scores[group.name]]
+        if idx > 0 and ordered[idx - 1][1] is not None:
+            neighbors.append(scores[ordered[idx - 1][0].name])
+        if idx + 1 < len(ordered) and ordered[idx + 1][1] is not None:
+            neighbors.append(scores[ordered[idx + 1][0].name])
+        neighborhood_mean = sum(neighbors) / len(neighbors)
+        result[group.name] = (1.0 - alpha) * scores[group.name] + alpha * neighborhood_mean
+    return result
+
+
+def collect_group_importance_scores(
+    model,
+    expert_groups: List[ExpertGroup],
+    dataloader,
+    device,
+    max_batches: int,
+    smoothing: float = 0.25,
+):
+    stats = {}
+    handles = []
+
+    for group in expert_groups:
+        gate = group.gate
+        if gate is None:
+            continue
+        stats[group.name] = {
+            "counts": torch.zeros(len(group.experts), dtype=torch.float64),
+            "selected_prob_sum": 0.0,
+            "tokens": 0,
+            "top_k": _infer_router_top_k(model, group),
+        }
+
+        def make_hook(group_name: str):
+            def hook(_mod, inp, out):
+                logits = out[0] if isinstance(out, tuple) else out
+                if not isinstance(logits, torch.Tensor):
+                    return
+                if logits.shape[-1] != len(stats[group_name]["counts"]):
+                    return
+                probs = torch.softmax(logits.detach().float(), dim=-1)
+                top_k = min(stats[group_name]["top_k"], probs.shape[-1])
+                topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+                flat_idx = topk_idx.reshape(-1).cpu()
+                counts = torch.bincount(flat_idx, minlength=probs.shape[-1]).to(torch.float64)
+                stats[group_name]["counts"] += counts
+                stats[group_name]["selected_prob_sum"] += float(topk_probs.sum().item())
+                stats[group_name]["tokens"] += int(topk_idx.numel() // top_k)
+
+            return hook
+
+        handles.append(gate.register_forward_hook(make_hook(group.name)))
+
+    if not handles:
+        return {group.name: 1.0 for group in expert_groups}
+
+    model.eval()
+    for step, batch in tqdm(enumerate(dataloader), desc="Collecting layer importance..."):
+        if step >= max_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+
+    for handle in handles:
+        handle.remove()
+
+    raw_scores = {}
+    for group in expert_groups:
+        stat = stats.get(group.name)
+        if not stat or stat["tokens"] == 0 or stat["counts"].sum().item() == 0:
+            raw_scores[group.name] = 1.0
+            continue
+        freq = stat["counts"] / stat["counts"].sum()
+        concentration = float(torch.linalg.vector_norm(freq, ord=2).item() * (len(freq) ** 0.5))
+        avg_selected_prob = stat["selected_prob_sum"] / stat["tokens"]
+        raw_scores[group.name] = max(concentration * avg_selected_prob, 1e-8)
+
+    return _smooth_scores(expert_groups, raw_scores, smoothing)
+
+
+def _group_original_params(group: ExpertGroup, linear_names: List[str]) -> int:
+    total = 0
+    for linear_name in linear_names:
+        if hasattr(group.experts[0], linear_name):
+            weight = getattr(group.experts[0], linear_name).weight
+            total += len(group.experts) * weight.shape[0] * weight.shape[1]
+    return total
+
+
+def allocate_group_reductions(
+    expert_groups: List[ExpertGroup],
+    linear_names: List[str],
+    global_target_reduction: float,
+    importance_scores: Dict[str, float],
+):
+    original_params = {group.name: _group_original_params(group, linear_names) for group in expert_groups}
+    total_original = sum(original_params.values())
+    if total_original <= 0:
+        raise RuntimeError("No compressible expert parameters found for allocation")
+
+    score_sum = sum(max(importance_scores.get(group.name, 1.0), 1e-8) for group in expert_groups)
+    total_target = int(round((1.0 - global_target_reduction) * total_original))
+
+    allocations: Dict[str, GroupAllocation] = {}
+    running_target = 0
+    for idx, group in enumerate(expert_groups):
+        importance = max(importance_scores.get(group.name, 1.0), 1e-8)
+        weight = importance / score_sum
+        if idx == len(expert_groups) - 1:
+            target_params = max(1, total_target - running_target)
+        else:
+            target_params = int(round(total_target * weight))
+            running_target += target_params
+        target_params = max(1, min(original_params[group.name], target_params))
+        target_reduction = 1.0 - (target_params / original_params[group.name])
+        target_reduction = min(max(target_reduction, 1e-6), 0.999999)
+        allocations[group.name] = GroupAllocation(
+            importance=importance,
+            weight=weight,
+            original_params=original_params[group.name],
+            target_params=target_params,
+            target_reduction=target_reduction,
+        )
+    return allocations
+
+
+def compress_group(
+    model,
+    group,
+    linear_names: List[str],
+    dataloader,
+    device,
+    max_batches: int,
+    target_reduction: float,
+    whitening: str,
+    eps: float,
+    tucker_device: str = "auto",
+    preserve_expert_dim: bool = False,
+):
     results = {}
     available_linear_names = [linear_name for linear_name in linear_names if hasattr(group.experts[0], linear_name)]
     covariance_cache = {}
@@ -189,7 +381,10 @@ def compress_group(model, group, linear_names: List[str], dataloader, device, ma
         weight_tensor = stack_expert_weights(group.experts, linear_name).to(device)
         k, d_out, d_in = weight_tensor.shape
 
-        rank_cfg = RankSearchConfig(target_reduction=target_reduction)
+        rank_cfg = RankSearchConfig(
+            target_reduction=target_reduction,
+            fixed_r1=k if preserve_expert_dim else None,
+        )
         rank_res = search_ranks(k, d_out, d_in, rank_cfg)
 
         s_in = s_in_inv = None
@@ -258,6 +453,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--save-pretrained-path", type=str, default=None, help="Optional HF-format export path for the compressed model")
+    parser.add_argument("--preserve-expert-dim", action="store_true", help="Keep the expert-mode Tucker rank fixed to the original number of experts")
+    parser.add_argument("--auto-preserve-expert-dim", action="store_true", help="Automatically preserve expert dimension for small-expert MoE layers such as Mixtral")
+    parser.add_argument("--layer-allocation", choices=["uniform", "router"], default="uniform", help="How to distribute the compression budget across MoE layers")
+    parser.add_argument("--layer-allocation-smoothing", type=float, default=0.25, help="Neighbor smoothing strength for router-based layer allocation")
     parser.add_argument("--eval-perplexity-datasets", type=str, default=None, help="Comma-separated list, e.g. wiki,ptb,c4")
     parser.add_argument("--eval-max-samples", type=int, default=None)
     parser.add_argument("--eval-seq-len", type=int, default=None)
@@ -293,12 +492,46 @@ def main():
     expert_groups = find_expert_groups(model)
     if not expert_groups:
         raise RuntimeError("No expert groups found in model")
+    preserve_expert_dim = args.preserve_expert_dim
+    if args.auto_preserve_expert_dim and expert_groups:
+        max_num_experts = max(len(group.experts) for group in expert_groups)
+        if max_num_experts <= 8:
+            preserve_expert_dim = True
+            print("[tdmoe] Enabling expert-dimension preservation automatically for small-expert MoE layers")
 
     linear_names = [n.strip() for n in args.linear_names.split(",") if n.strip()]
+    group_allocations = None
+    if args.layer_allocation == "router":
+        print("[tdmoe] Collecting router-based layer importance scores")
+        importance_scores = collect_group_importance_scores(
+            model=model,
+            expert_groups=expert_groups,
+            dataloader=dataloader,
+            device=args.device,
+            max_batches=args.max_batches,
+            smoothing=args.layer_allocation_smoothing,
+        )
+        group_allocations = allocate_group_reductions(
+            expert_groups=expert_groups,
+            linear_names=linear_names,
+            global_target_reduction=args.target_reduction,
+            importance_scores=importance_scores,
+        )
+        print("[tdmoe] Layer-wise compression allocation:")
+        for group in expert_groups:
+            alloc = group_allocations[group.name]
+            print(
+                f"  {group.name}: importance={alloc.importance:.4f} weight={alloc.weight:.4f} "
+                f"orig={alloc.original_params} target={alloc.target_params} "
+                f"reduction={alloc.target_reduction:.4f}"
+            )
 
     all_results = {}
     for i, group in enumerate(expert_groups):
         print(f"Compressing group {i+1} of {len(expert_groups)}")
+        group_target_reduction = args.target_reduction
+        if group_allocations is not None:
+            group_target_reduction = group_allocations[group.name].target_reduction
         res = compress_group(
             model=model,
             group=group,
@@ -306,10 +539,11 @@ def main():
             dataloader=dataloader,
             device=args.device,
             max_batches=args.max_batches,
-            target_reduction=args.target_reduction,
+            target_reduction=group_target_reduction,
             whitening=args.whitening,
             eps=args.eps,
             tucker_device=args.tucker_device,
+            preserve_expert_dim=preserve_expert_dim,
         )
         if res:
             all_results[group.name] = res
@@ -377,6 +611,16 @@ def main():
     if args.eval_report_path:
         payload = {
             "compression": all_results,
+            "layer_allocations": {
+                name: {
+                    "importance": alloc.importance,
+                    "weight": alloc.weight,
+                    "original_params": alloc.original_params,
+                    "target_params": alloc.target_params,
+                    "target_reduction": alloc.target_reduction,
+                }
+                for name, alloc in (group_allocations or {}).items()
+            },
             "perplexity": perplexity_results,
             "lm_eval": lm_eval_results,
         }

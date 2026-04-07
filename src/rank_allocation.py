@@ -10,6 +10,7 @@ class RankSearchConfig:
     target_reduction: float
     r1_list: Optional[Iterable[int]] = None
     r2_list: Optional[Iterable[int]] = None
+    fixed_r1: Optional[int] = None
     max_r1: Optional[int] = None
     max_r2: Optional[int] = None
     max_r3: Optional[int] = None
@@ -41,7 +42,11 @@ def search_ranks(k: int, d_out: int, d_in: int, cfg: RankSearchConfig) -> RankSe
 
     target_params = math.ceil((1.0 - cfg.target_reduction) * k * d_out * d_in)
 
-    if cfg.r1_list is None:
+    if cfg.fixed_r1 is not None:
+        if not 1 <= cfg.fixed_r1 <= max_r1:
+            raise ValueError(f"fixed_r1 must be in [1, {max_r1}]")
+        r1_list = [cfg.fixed_r1]
+    elif cfg.r1_list is None:
         r1_list = range(1, max_r1 + 1, max(cfg.step_r1, 1))
     else:
         r1_list = [r for r in cfg.r1_list if 1 <= r <= max_r1]

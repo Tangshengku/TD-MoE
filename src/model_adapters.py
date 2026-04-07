@@ -9,7 +9,9 @@ import torch
 @dataclass
 class ExpertGroup:
     name: str
+    module: torch.nn.Module
     experts: List[torch.nn.Module]
+    gate: torch.nn.Module | None = None
 
 
 def find_expert_groups(model: torch.nn.Module) -> List[ExpertGroup]:
@@ -18,7 +20,8 @@ def find_expert_groups(model: torch.nn.Module) -> List[ExpertGroup]:
         if hasattr(module, "experts"):
             experts = getattr(module, "experts")
             if isinstance(experts, torch.nn.ModuleList) and len(experts) > 0:
-                groups.append(ExpertGroup(name=name, experts=list(experts)))
+                gate = getattr(module, "gate", None)
+                groups.append(ExpertGroup(name=name, module=module, experts=list(experts), gate=gate))
     return groups
 
 
