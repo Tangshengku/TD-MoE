@@ -235,20 +235,30 @@ def _smooth_scores(groups: List[ExpertGroup], scores: Dict[str, float], alpha: f
     return result
 
 
-def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2) -> int:
-    singular_values = torch.linalg.svdvals(weight.detach().float().cpu())
+def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2, rank_device: str = "auto") -> int:
+    matrix = weight.detach().float()
+    if rank_device == "cpu":
+        matrix = matrix.cpu()
+    elif rank_device == "cuda":
+        matrix = matrix.cuda()
+    singular_values = torch.linalg.svdvals(matrix)
     if singular_values.numel() == 0:
+        del matrix, singular_values
+        cleanup_memory()
         return 1
     threshold = torch.max(singular_values) * threshold_ratio
-    return max(1, int(torch.sum(singular_values > threshold).item()))
+    rank = max(1, int(torch.sum(singular_values > threshold).item()))
+    del matrix, singular_values
+    cleanup_memory()
+    return rank
 
 
-def _expert_principal_rank(expert, linear_names: List[str], threshold_ratio: float = 1e-2) -> float:
+def _expert_principal_rank(expert, linear_names: List[str], threshold_ratio: float = 1e-2, rank_device: str = "auto") -> float:
     ranks = []
     for linear_name in linear_names:
         if hasattr(expert, linear_name):
             mod = getattr(expert, linear_name)
-            ranks.append(_principal_rank(mod.weight.data, threshold_ratio=threshold_ratio))
+            ranks.append(_principal_rank(mod.weight.data, threshold_ratio=threshold_ratio, rank_device=rank_device))
     return float(sum(ranks) if ranks else 1.0)
 
 
@@ -261,6 +271,7 @@ def collect_group_sensitivity_scores(
     linear_names: List[str],
     tau: float = 2.0,
     smoothing: float = 0.25,
+    rank_device: str = "auto",
 ):
     stats = {}
     pass1_handles = []
@@ -274,7 +285,7 @@ def collect_group_sensitivity_scores(
             "numel": torch.zeros(len(group.experts), dtype=torch.float64),
             "outliers": torch.zeros(len(group.experts), dtype=torch.float64),
             "principal_rank": torch.tensor(
-                [_expert_principal_rank(expert, linear_names) for expert in group.experts],
+                [_expert_principal_rank(expert, linear_names, rank_device=rank_device) for expert in group.experts],
                 dtype=torch.float64,
             ),
         }
@@ -544,6 +555,7 @@ def main():
     parser.add_argument("--layer-allocation", choices=["uniform", "moe_svd"], default="moe_svd", help="How to distribute the compression budget across MoE layers")
     parser.add_argument("--layer-allocation-smoothing", type=float, default=0.25, help="Neighbor smoothing strength for MoE-SVD-style layer sensitivity")
     parser.add_argument("--layer-sensitivity-tau", type=float, default=2.0, help="Activation outlier threshold multiplier for MoE-SVD-style layer sensitivity")
+    parser.add_argument("--layer-sensitivity-rank-device", choices=["auto", "cpu", "cuda"], default="auto", help="Device for principal-rank SVD during layer sensitivity scoring")
     parser.add_argument("--eval-perplexity-datasets", type=str, default=None, help="Comma-separated list, e.g. wiki,ptb,c4")
     parser.add_argument("--eval-max-samples", type=int, default=None)
     parser.add_argument("--eval-seq-len", type=int, default=None)
@@ -599,6 +611,7 @@ def main():
             linear_names=linear_names,
             tau=args.layer_sensitivity_tau,
             smoothing=args.layer_allocation_smoothing,
+            rank_device=args.layer_sensitivity_rank_device,
         )
         group_allocations = select_groups_for_compression(
             expert_groups=expert_groups,
