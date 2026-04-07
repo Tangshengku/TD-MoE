@@ -181,8 +181,8 @@ def collect_group_covariances(
 
 @dataclass
 class GroupAllocation:
-    importance: float
-    weight: float
+    selected: bool
+    sensitivity: float
     original_params: int
     target_params: int
     target_reduction: float
@@ -228,72 +228,141 @@ def _smooth_scores(groups: List[ExpertGroup], scores: Dict[str, float], alpha: f
     return result
 
 
-def collect_group_importance_scores(
+def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2) -> int:
+    singular_values = torch.linalg.svdvals(weight.detach().float())
+    if singular_values.numel() == 0:
+        return 1
+    threshold = torch.max(singular_values) * threshold_ratio
+    return max(1, int(torch.sum(singular_values > threshold).item()))
+
+
+def _expert_principal_rank(expert, linear_names: List[str], threshold_ratio: float = 1e-2) -> float:
+    ranks = []
+    for linear_name in linear_names:
+        if hasattr(expert, linear_name):
+            mod = getattr(expert, linear_name)
+            ranks.append(_principal_rank(mod.weight.data, threshold_ratio=threshold_ratio))
+    return float(sum(ranks) if ranks else 1.0)
+
+
+def collect_group_sensitivity_scores(
     model,
     expert_groups: List[ExpertGroup],
     dataloader,
     device,
     max_batches: int,
+    linear_names: List[str],
+    tau: float = 2.0,
     smoothing: float = 0.25,
 ):
     stats = {}
-    handles = []
+    pass1_handles = []
 
     for group in expert_groups:
-        gate = group.gate
-        if gate is None:
-            continue
         stats[group.name] = {
             "counts": torch.zeros(len(group.experts), dtype=torch.float64),
-            "selected_prob_sum": 0.0,
             "tokens": 0,
             "top_k": _infer_router_top_k(model, group),
+            "sum_abs": torch.zeros(len(group.experts), dtype=torch.float64),
+            "numel": torch.zeros(len(group.experts), dtype=torch.float64),
+            "outliers": torch.zeros(len(group.experts), dtype=torch.float64),
+            "principal_rank": torch.tensor(
+                [_expert_principal_rank(expert, linear_names) for expert in group.experts],
+                dtype=torch.float64,
+            ),
         }
 
-        def make_hook(group_name: str):
-            def hook(_mod, inp, out):
-                logits = out[0] if isinstance(out, tuple) else out
-                if not isinstance(logits, torch.Tensor):
-                    return
-                if logits.shape[-1] != len(stats[group_name]["counts"]):
-                    return
-                probs = torch.softmax(logits.detach().float(), dim=-1)
-                top_k = min(stats[group_name]["top_k"], probs.shape[-1])
-                topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
-                flat_idx = topk_idx.reshape(-1).cpu()
-                counts = torch.bincount(flat_idx, minlength=probs.shape[-1]).to(torch.float64)
-                stats[group_name]["counts"] += counts
-                stats[group_name]["selected_prob_sum"] += float(topk_probs.sum().item())
-                stats[group_name]["tokens"] += int(topk_idx.numel() // top_k)
+        if group.gate is not None:
+            def make_gate_hook(group_name: str):
+                def hook(_mod, inp, out):
+                    logits = out[0] if isinstance(out, tuple) else out
+                    if not isinstance(logits, torch.Tensor):
+                        return
+                    if logits.shape[-1] != len(stats[group_name]["counts"]):
+                        return
+                    top_k = min(stats[group_name]["top_k"], logits.shape[-1])
+                    topk_idx = torch.topk(logits.detach().float(), k=top_k, dim=-1).indices
+                    flat_idx = topk_idx.reshape(-1).cpu()
+                    counts = torch.bincount(flat_idx, minlength=logits.shape[-1]).to(torch.float64)
+                    stats[group_name]["counts"] += counts
+                    stats[group_name]["tokens"] += int(topk_idx.numel() // top_k)
 
-            return hook
+                return hook
 
-        handles.append(gate.register_forward_hook(make_hook(group.name)))
+            pass1_handles.append(group.gate.register_forward_hook(make_gate_hook(group.name)))
 
-    if not handles:
+        for expert_idx, expert in enumerate(group.experts):
+            def make_activation_hook(group_name: str, idx: int):
+                def hook(_mod, inp, _out):
+                    if not inp:
+                        return
+                    x = inp[0].detach().float()
+                    abs_x = torch.abs(x)
+                    stats[group_name]["sum_abs"][idx] += float(abs_x.sum().item())
+                    stats[group_name]["numel"][idx] += float(abs_x.numel())
+
+                return hook
+
+            pass1_handles.append(expert.register_forward_hook(make_activation_hook(group.name, expert_idx)))
+
+    if not pass1_handles:
         return {group.name: 1.0 for group in expert_groups}
 
     model.eval()
-    for step, batch in tqdm(enumerate(dataloader), desc="Collecting layer importance..."):
+    for step, batch in tqdm(enumerate(dataloader), desc="Collecting sensitivity pass 1..."):
         if step >= max_batches:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
 
-    for handle in handles:
+    for handle in pass1_handles:
+        handle.remove()
+
+    mean_abs = {}
+    for group in expert_groups:
+        group_mean_abs = torch.ones(len(group.experts), dtype=torch.float64)
+        valid = stats[group.name]["numel"] > 0
+        group_mean_abs[valid] = stats[group.name]["sum_abs"][valid] / stats[group.name]["numel"][valid]
+        mean_abs[group.name] = group_mean_abs
+
+    pass2_handles = []
+    for group in expert_groups:
+        for expert_idx, expert in enumerate(group.experts):
+            def make_outlier_hook(group_name: str, idx: int):
+                def hook(_mod, inp, _out):
+                    if not inp:
+                        return
+                    x = inp[0].detach().float()
+                    threshold = tau * mean_abs[group_name][idx]
+                    stats[group_name]["outliers"][idx] += float(torch.sum(torch.abs(x) > threshold).item())
+
+                return hook
+
+            pass2_handles.append(expert.register_forward_hook(make_outlier_hook(group.name, expert_idx)))
+
+    for step, batch in tqdm(enumerate(dataloader), desc="Collecting sensitivity pass 2..."):
+        if step >= max_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+
+    for handle in pass2_handles:
         handle.remove()
 
     raw_scores = {}
     for group in expert_groups:
-        stat = stats.get(group.name)
-        if not stat or stat["tokens"] == 0 or stat["counts"].sum().item() == 0:
+        group_stats = stats[group.name]
+        if group_stats["tokens"] <= 0:
             raw_scores[group.name] = 1.0
             continue
-        freq = stat["counts"] / stat["counts"].sum()
-        concentration = float(torch.linalg.vector_norm(freq, ord=2).item() * (len(freq) ** 0.5))
-        avg_selected_prob = stat["selected_prob_sum"] / stat["tokens"]
-        raw_scores[group.name] = max(concentration * avg_selected_prob, 1e-8)
+        f_i = group_stats["counts"] / group_stats["tokens"]
+        a_i = torch.zeros_like(group_stats["numel"])
+        valid = group_stats["numel"] > 0
+        a_i[valid] = group_stats["outliers"][valid] / group_stats["numel"][valid]
+        p_i = group_stats["principal_rank"]
+        raw_scores[group.name] = float(torch.sum(f_i * p_i * a_i).item())
 
     return _smooth_scores(expert_groups, raw_scores, smoothing)
 
@@ -307,36 +376,40 @@ def _group_original_params(group: ExpertGroup, linear_names: List[str]) -> int:
     return total
 
 
-def allocate_group_reductions(
+def select_groups_for_compression(
     expert_groups: List[ExpertGroup],
     linear_names: List[str],
     global_target_reduction: float,
-    importance_scores: Dict[str, float],
+    sensitivity_scores: Dict[str, float],
 ):
     original_params = {group.name: _group_original_params(group, linear_names) for group in expert_groups}
     total_original = sum(original_params.values())
     if total_original <= 0:
-        raise RuntimeError("No compressible expert parameters found for allocation")
+        raise RuntimeError("No compressible expert parameters found for selection")
 
-    score_sum = sum(max(importance_scores.get(group.name, 1.0), 1e-8) for group in expert_groups)
-    total_target = int(round((1.0 - global_target_reduction) * total_original))
+    params_to_remove = total_original * global_target_reduction
+    ranked_groups = sorted(expert_groups, key=lambda group: (sensitivity_scores.get(group.name, float("inf")), group.name))
+
+    selected_names = []
+    selected_params = 0
+    for group in ranked_groups:
+        if selected_params >= params_to_remove and selected_names:
+            break
+        selected_names.append(group.name)
+        selected_params += original_params[group.name]
+
+    selected_reduction = params_to_remove / max(selected_params, 1)
+    selected_reduction = min(max(selected_reduction, 1e-6), 0.999999)
 
     allocations: Dict[str, GroupAllocation] = {}
-    running_target = 0
-    for idx, group in enumerate(expert_groups):
-        importance = max(importance_scores.get(group.name, 1.0), 1e-8)
-        weight = importance / score_sum
-        if idx == len(expert_groups) - 1:
-            target_params = max(1, total_target - running_target)
-        else:
-            target_params = int(round(total_target * weight))
-            running_target += target_params
+    for group in expert_groups:
+        selected = group.name in selected_names
+        target_reduction = selected_reduction if selected else 0.0
+        target_params = int(round(original_params[group.name] * (1.0 - target_reduction)))
         target_params = max(1, min(original_params[group.name], target_params))
-        target_reduction = 1.0 - (target_params / original_params[group.name])
-        target_reduction = min(max(target_reduction, 1e-6), 0.999999)
         allocations[group.name] = GroupAllocation(
-            importance=importance,
-            weight=weight,
+            selected=selected,
+            sensitivity=max(sensitivity_scores.get(group.name, 1.0), 0.0),
             original_params=original_params[group.name],
             target_params=target_params,
             target_reduction=target_reduction,
@@ -455,8 +528,9 @@ def main():
     parser.add_argument("--save-pretrained-path", type=str, default=None, help="Optional HF-format export path for the compressed model")
     parser.add_argument("--preserve-expert-dim", action="store_true", help="Keep the expert-mode Tucker rank fixed to the original number of experts")
     parser.add_argument("--auto-preserve-expert-dim", action="store_true", help="Automatically preserve expert dimension for small-expert MoE layers such as Mixtral")
-    parser.add_argument("--layer-allocation", choices=["uniform", "router"], default="uniform", help="How to distribute the compression budget across MoE layers")
-    parser.add_argument("--layer-allocation-smoothing", type=float, default=0.25, help="Neighbor smoothing strength for router-based layer allocation")
+    parser.add_argument("--layer-allocation", choices=["uniform", "moe_svd"], default="moe_svd", help="How to distribute the compression budget across MoE layers")
+    parser.add_argument("--layer-allocation-smoothing", type=float, default=0.25, help="Neighbor smoothing strength for MoE-SVD-style layer sensitivity")
+    parser.add_argument("--layer-sensitivity-tau", type=float, default=2.0, help="Activation outlier threshold multiplier for MoE-SVD-style layer sensitivity")
     parser.add_argument("--eval-perplexity-datasets", type=str, default=None, help="Comma-separated list, e.g. wiki,ptb,c4")
     parser.add_argument("--eval-max-samples", type=int, default=None)
     parser.add_argument("--eval-seq-len", type=int, default=None)
@@ -501,27 +575,29 @@ def main():
 
     linear_names = [n.strip() for n in args.linear_names.split(",") if n.strip()]
     group_allocations = None
-    if args.layer_allocation == "router":
-        print("[tdmoe] Collecting router-based layer importance scores")
-        importance_scores = collect_group_importance_scores(
+    if args.layer_allocation == "moe_svd":
+        print("[tdmoe] Collecting MoE-SVD-style layer sensitivity scores")
+        sensitivity_scores = collect_group_sensitivity_scores(
             model=model,
             expert_groups=expert_groups,
             dataloader=dataloader,
             device=args.device,
             max_batches=args.max_batches,
+            linear_names=linear_names,
+            tau=args.layer_sensitivity_tau,
             smoothing=args.layer_allocation_smoothing,
         )
-        group_allocations = allocate_group_reductions(
+        group_allocations = select_groups_for_compression(
             expert_groups=expert_groups,
             linear_names=linear_names,
             global_target_reduction=args.target_reduction,
-            importance_scores=importance_scores,
+            sensitivity_scores=sensitivity_scores,
         )
-        print("[tdmoe] Layer-wise compression allocation:")
+        print("[tdmoe] MoE-SVD-style layer selection:")
         for group in expert_groups:
             alloc = group_allocations[group.name]
             print(
-                f"  {group.name}: importance={alloc.importance:.4f} weight={alloc.weight:.4f} "
+                f"  {group.name}: selected={alloc.selected} sensitivity={alloc.sensitivity:.4f} "
                 f"orig={alloc.original_params} target={alloc.target_params} "
                 f"reduction={alloc.target_reduction:.4f}"
             )
@@ -532,6 +608,9 @@ def main():
         group_target_reduction = args.target_reduction
         if group_allocations is not None:
             group_target_reduction = group_allocations[group.name].target_reduction
+        if group_target_reduction <= 0:
+            print(f"[tdmoe] Skipping {group.name} because it was not selected for compression")
+            continue
         res = compress_group(
             model=model,
             group=group,
@@ -613,8 +692,8 @@ def main():
             "compression": all_results,
             "layer_allocations": {
                 name: {
-                    "importance": alloc.importance,
-                    "weight": alloc.weight,
+                    "selected": alloc.selected,
+                    "sensitivity": alloc.sensitivity,
                     "original_params": alloc.original_params,
                     "target_params": alloc.target_params,
                     "target_reduction": alloc.target_reduction,
