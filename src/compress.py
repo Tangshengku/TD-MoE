@@ -240,7 +240,7 @@ def _smooth_scores(groups: List[ExpertGroup], scores: Dict[str, float], alpha: f
     return result
 
 
-def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2, rank_device: str = "auto") -> int:
+def _principal_rank_exact(weight: torch.Tensor, threshold_ratio: float = 1e-2, rank_device: str = "auto") -> int:
     matrix = weight.detach().float()
     if rank_device == "cpu":
         matrix = matrix.cpu()
@@ -258,12 +258,57 @@ def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2, rank_de
     return rank
 
 
-def _expert_principal_rank(expert, linear_names: List[str], threshold_ratio: float = 1e-2, rank_device: str = "auto") -> float:
+def _principal_rank_stable(weight: torch.Tensor, rank_device: str = "auto") -> int:
+    matrix = weight.detach().float()
+    if rank_device == "cpu":
+        matrix = matrix.cpu()
+    elif rank_device == "cuda":
+        matrix = matrix.cuda()
+    fro_sq = torch.sum(matrix * matrix)
+    spectral = torch.linalg.matrix_norm(matrix, ord=2)
+    if spectral.numel() == 0 or float(spectral.item()) == 0.0:
+        del matrix, fro_sq, spectral
+        cleanup_memory()
+        return 1
+    stable_rank = fro_sq / (spectral * spectral)
+    rank = max(1, int(round(float(stable_rank.item()))))
+    del matrix, fro_sq, spectral
+    cleanup_memory()
+    return rank
+
+
+def _principal_rank(
+    weight: torch.Tensor,
+    threshold_ratio: float = 1e-2,
+    rank_device: str = "auto",
+    rank_metric: str = "stable_rank",
+) -> int:
+    if rank_metric == "exact":
+        return _principal_rank_exact(weight, threshold_ratio=threshold_ratio, rank_device=rank_device)
+    if rank_metric == "stable_rank":
+        return _principal_rank_stable(weight, rank_device=rank_device)
+    raise ValueError(f"Unsupported rank_metric: {rank_metric}")
+
+
+def _expert_principal_rank(
+    expert,
+    linear_names: List[str],
+    threshold_ratio: float = 1e-2,
+    rank_device: str = "auto",
+    rank_metric: str = "stable_rank",
+) -> float:
     ranks = []
     for linear_name in linear_names:
         if hasattr(expert, linear_name):
             mod = getattr(expert, linear_name)
-            ranks.append(_principal_rank(mod.weight.data, threshold_ratio=threshold_ratio, rank_device=rank_device))
+            ranks.append(
+                _principal_rank(
+                    mod.weight.data,
+                    threshold_ratio=threshold_ratio,
+                    rank_device=rank_device,
+                    rank_metric=rank_metric,
+                )
+            )
     return float(sum(ranks) if ranks else 1.0)
 
 
@@ -277,6 +322,7 @@ def collect_group_sensitivity_scores(
     tau: float = 2.0,
     smoothing: float = 0.25,
     rank_device: str = "auto",
+    rank_metric: str = "stable_rank",
 ):
     stats = {}
     pass1_handles = []
@@ -290,7 +336,15 @@ def collect_group_sensitivity_scores(
             "numel": torch.zeros(len(group.experts), dtype=torch.float64),
             "outliers": torch.zeros(len(group.experts), dtype=torch.float64),
             "principal_rank": torch.tensor(
-                [_expert_principal_rank(expert, linear_names, rank_device=rank_device) for expert in group.experts],
+                [
+                    _expert_principal_rank(
+                        expert,
+                        linear_names,
+                        rank_device=rank_device,
+                        rank_metric=rank_metric,
+                    )
+                    for expert in group.experts
+                ],
                 dtype=torch.float64,
             ),
         }
@@ -558,6 +612,7 @@ def main():
     parser.add_argument("--layer-allocation-smoothing", type=float, default=0.25, help="Neighbor smoothing strength for MoE-SVD-style layer sensitivity")
     parser.add_argument("--layer-sensitivity-tau", type=float, default=2.0, help="Activation outlier threshold multiplier for MoE-SVD-style layer sensitivity")
     parser.add_argument("--layer-sensitivity-rank-device", choices=["auto", "cpu", "cuda"], default="auto", help="Device for principal-rank SVD during layer sensitivity scoring")
+    parser.add_argument("--layer-sensitivity-rank-metric", choices=["stable_rank", "exact"], default="stable_rank", help="Rank proxy used in layer sensitivity scoring")
     parser.add_argument("--eval-perplexity-datasets", type=str, default=None, help="Comma-separated list, e.g. wiki,ptb,c4")
     parser.add_argument("--eval-max-samples", type=int, default=None)
     parser.add_argument("--eval-seq-len", type=int, default=None)
@@ -618,6 +673,7 @@ def main():
             tau=args.layer_sensitivity_tau,
             smoothing=args.layer_allocation_smoothing,
             rank_device=args.layer_sensitivity_rank_device,
+            rank_metric=args.layer_sensitivity_rank_metric,
         )
         group_allocations = select_groups_for_compression(
             expert_groups=expert_groups,
