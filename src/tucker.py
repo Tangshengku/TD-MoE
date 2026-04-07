@@ -46,7 +46,7 @@ def tucker_decompose(
     tensor: torch.Tensor,
     ranks: tuple[int, int, int],
     init: str = "svd",
-    tol: float = 1e-6,
+    tol: float = 1e-4,
     n_iter_max: int = 50,
     device_override: str | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
