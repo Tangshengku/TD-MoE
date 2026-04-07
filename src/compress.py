@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -25,6 +26,12 @@ from model_adapters import ExpertGroup, find_expert_groups, stack_expert_weights
 from rank_allocation import RankSearchConfig, search_ranks
 from tucker import whiten_tensor, recolor_factors, tucker_decompose, reconstruct
 from stats import OnlineCovariance, whitening_from_cov
+
+
+def cleanup_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def load_calibration_texts(path: str | None, extra: List[str] | None) -> List[str]:
@@ -229,7 +236,7 @@ def _smooth_scores(groups: List[ExpertGroup], scores: Dict[str, float], alpha: f
 
 
 def _principal_rank(weight: torch.Tensor, threshold_ratio: float = 1e-2) -> int:
-    singular_values = torch.linalg.svdvals(weight.detach().float())
+    singular_values = torch.linalg.svdvals(weight.detach().float().cpu())
     if singular_values.numel() == 0:
         return 1
     threshold = torch.max(singular_values) * threshold_ratio
@@ -364,6 +371,8 @@ def collect_group_sensitivity_scores(
         p_i = group_stats["principal_rank"]
         raw_scores[group.name] = float(torch.sum(f_i * p_i * a_i).item())
 
+    del stats, mean_abs
+    cleanup_memory()
     return _smooth_scores(expert_groups, raw_scores, smoothing)
 
 
@@ -501,7 +510,11 @@ def compress_group(
             "target_params": rank_res.target_params,
             "diff": rank_res.diff,
         }
+        del weight_tensor, t_whitened, core, factors, t_rec
+        cleanup_memory()
 
+    del covariance_cache
+    cleanup_memory()
     return results
 
 
@@ -601,6 +614,8 @@ def main():
                 f"orig={alloc.original_params} target={alloc.target_params} "
                 f"reduction={alloc.target_reduction:.4f}"
             )
+        del sensitivity_scores
+        cleanup_memory()
 
     all_results = {}
     for i, group in enumerate(expert_groups):
@@ -626,6 +641,7 @@ def main():
         )
         if res:
             all_results[group.name] = res
+        cleanup_memory()
 
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
